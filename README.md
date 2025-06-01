@@ -1,4 +1,6 @@
-# Cheating Daddy
+# Julie
+
+An AI-powered interview assistant that helps you excel in job interviews by providing real-time guidance and feedback.
 
 > [!NOTE]  
 > Use latest MacOS and Windows version, older versions have limited support

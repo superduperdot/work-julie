@@ -59,7 +59,7 @@ function testSystemAudio() {
             analyzeAudioBuffer(audioBuffer, 'SystemAudioDump Output');
 
             // Save as WAV for playback
-            const outputDir = path.join(process.env.HOME || process.env.USERPROFILE, 'cheddar', 'test');
+            const outputDir = path.join(process.env.HOME || process.env.USERPROFILE, 'julie', 'test');
             if (!fs.existsSync(outputDir)) {
                 fs.mkdirSync(outputDir, { recursive: true });
             }

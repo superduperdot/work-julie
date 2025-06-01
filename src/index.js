@@ -1,31 +1,227 @@
+require('@electron/remote/main').initialize();
+
 if (require('electron-squirrel-startup')) {
     process.exit(0);
 }
 
-const { app, BrowserWindow, desktopCapturer, globalShortcut, session, ipcMain, shell, screen } = require('electron');
+const { app, BrowserWindow, desktopCapturer, globalShortcut, session, ipcMain, shell, screen, dialog, systemPreferences } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
-const { GoogleGenAI } = require('@google/genai');
 const os = require('os');
 const { spawn } = require('child_process');
 const { pcmToWav, analyzeAudioBuffer, saveDebugAudio } = require('./audioUtils');
 const { getSystemPrompt } = require('./prompts');
+const logger = require('./logger');
+const { calculateAudioLevel, AUDIO_THRESHOLDS } = require('./audioUtils');
+const sessionManager = require('./sessionManager');
 
-let geminiSession = null;
 let loopbackProc = null;
 let systemAudioProc = null;
 let audioIntervalTimer = null;
 let mouseEventsIgnored = false;
 let messageBuffer = '';
+let audioContext = null;
+let audioProcessor = null;
+
+async function checkPermissionStatus() {
+    if (process.platform !== 'darwin') {
+        return { 
+            screen: { status: 'not_required', authorized: true },
+            microphone: { status: 'not_required', authorized: true }
+        };
+    }
+
+    try {
+        // Get current permission status
+        const screenStatus = systemPreferences.getMediaAccessStatus('screen');
+        const micStatus = systemPreferences.getMediaAccessStatus('microphone');
+        
+        // Get app name
+        const appName = app.getName();
+        
+        // Check if permissions are actually granted
+        const isScreenAuthorized = screenStatus === 'granted';
+        const isMicAuthorized = micStatus === 'granted';
+
+        // If not authorized, try requesting microphone permission
+        if (!isMicAuthorized) {
+            try {
+                const micGranted = await systemPreferences.askForMediaAccess('microphone');
+                if (micGranted) {
+                    return await checkPermissionStatus(); // Recursive call to get updated status
+                }
+            } catch (error) {
+                console.error('Error requesting microphone permission:', error);
+            }
+        }
+
+        return {
+            screen: {
+                status: screenStatus,
+                authorized: isScreenAuthorized,
+                appName: appName
+            },
+            microphone: {
+                status: micStatus,
+                authorized: isMicAuthorized,
+                appName: appName
+            }
+        };
+    } catch (error) {
+        console.error('Error checking permissions:', error);
+        return {
+            screen: {
+                status: 'error',
+                authorized: false,
+                appName: app.getName(),
+                error: error.message
+            },
+            microphone: {
+                status: 'error',
+                authorized: false,
+                appName: app.getName(),
+                error: error.message
+            }
+        };
+    }
+}
+
+async function requestMacOSPermissions() {
+    if (process.platform !== 'darwin') return true;
+
+    const permissions = await checkPermissionStatus();
+    
+    // Check screen recording permission
+    if (!permissions.screen.authorized) {
+        const response = await dialog.showMessageBox({
+            type: 'info',
+            title: 'Screen Recording Permission Required',
+            message: 'Julie needs screen recording permission.',
+            detail: `Current Status: ${permissions.screen.status}\n\n` +
+                   'Please follow these steps:\n\n' +
+                   '1. Keep Julie running\n' +
+                   '2. Open System Settings > Privacy & Security > Screen Recording\n' +
+                   '3. Find and enable "Julie"\n' +
+                   '4. Return here and click "Check Again"',
+            buttons: ['Open Settings', 'Check Again', 'Cancel'],
+            defaultId: 0
+        });
+
+        if (response.response === 0) {
+            shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+            return false;
+        } else if (response.response === 1) {
+            // Recursive call to check again
+            return await requestMacOSPermissions();
+        }
+        return false;
+    }
+
+    // Check microphone permission
+    if (!permissions.microphone.authorized) {
+        try {
+            const micAccess = await systemPreferences.askForMediaAccess('microphone');
+            if (!micAccess) {
+                const response = await dialog.showMessageBox({
+                    type: 'info',
+                    title: 'Microphone Permission Required',
+                    message: 'Julie needs microphone access.',
+                    detail: `Current Status: ${permissions.microphone.status}\n\n` +
+                           'Please follow these steps:\n\n' +
+                           '1. Keep Julie running\n' +
+                           '2. Open System Settings > Privacy & Security > Microphone\n' +
+                           '3. Find and enable "Julie"\n' +
+                           '4. Return here and click "Check Again"',
+                    buttons: ['Open Settings', 'Check Again', 'Cancel'],
+                    defaultId: 0
+                });
+
+                if (response.response === 0) {
+                    shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone');
+                    return false;
+                } else if (response.response === 1) {
+                    // Recursive call to check again
+                    return await requestMacOSPermissions();
+                }
+                return false;
+            }
+        } catch (error) {
+            console.error('Microphone permission error:', error);
+            dialog.showErrorBox(
+                'Permission Error',
+                `Failed to request microphone permission.\n\nError: ${error.message}\n\nPlease check System Settings > Privacy & Security > Microphone and ensure Julie is enabled.`
+            );
+            return false;
+        }
+    }
+
+    return true;
+}
+
+async function checkRequirements() {
+    const requirements = {
+        systemAudio: false,
+        screenCapture: false,
+        permissions: false
+    };
+
+    // Request permissions first
+    requirements.permissions = await requestMacOSPermissions();
+    if (!requirements.permissions) {
+        return false;
+    }
+
+    // Check SystemAudioDump on macOS
+    if (process.platform === 'darwin') {
+        const systemAudioPath = path.join(__dirname, 'SystemAudioDump');
+        if (!fs.existsSync(systemAudioPath)) {
+            dialog.showErrorBox(
+                'Missing SystemAudioDump',
+                'SystemAudioDump is required for audio capture on macOS. Please ensure it exists in the src directory.'
+            );
+            return false;
+        }
+        
+        // Make it executable and verify permissions
+        try {
+            // Ensure proper permissions
+            await fs.promises.chmod(systemAudioPath, '755');
+            requirements.systemAudio = true;
+        } catch (error) {
+            logger.error('Failed to setup SystemAudioDump', error);
+            dialog.showErrorBox(
+                'Permission Error',
+                'Failed to set up audio capture. Please check system permissions and try again.'
+            );
+            return false;
+        }
+    } else {
+        requirements.systemAudio = true; // Not needed on other platforms
+    }
+
+    // Ensure data directories exist
+    try {
+        ensureDataDirectories();
+    } catch (error) {
+        logger.error('Failed to create data directories:', error);
+        dialog.showErrorBox(
+            'Setup Error',
+            'Failed to create required directories. Please check permissions.'
+        );
+        return false;
+    }
+
+    return true;
+}
 
 function ensureDataDirectories() {
     const homeDir = os.homedir();
-    const cheddarDir = path.join(homeDir, 'cheddar');
-    const dataDir = path.join(cheddarDir, 'data');
+    const julieDir = path.join(homeDir, 'julie');
+    const dataDir = path.join(julieDir, 'data');
     const imageDir = path.join(dataDir, 'image');
     const audioDir = path.join(dataDir, 'audio');
 
-    [cheddarDir, dataDir, imageDir, audioDir].forEach(dir => {
+    [julieDir, dataDir, imageDir, audioDir].forEach(dir => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -51,9 +247,12 @@ function createWindow() {
             enableBlinkFeatures: 'GetDisplayMedia',
             webSecurity: true,
             allowRunningInsecureContent: false,
+            enableRemoteModule: true
         },
         backgroundColor: '#00000000',
     });
+
+    require('@electron/remote/main').enable(mainWindow.webContents);
 
     session.defaultSession.setDisplayMediaRequestHandler(
         (request, callback) => {
@@ -131,12 +330,7 @@ function createWindow() {
     globalShortcut.register(nextStepShortcut, async () => {
         console.log('Next step shortcut triggered');
         try {
-            if (geminiSession) {
-                await geminiSession.sendRealtimeInput({ text: 'What should be the next step here' });
-                console.log('Sent "next step" message to Gemini');
-            } else {
-                console.log('No active Gemini session');
-            }
+            await sessionManager.sendMessage('What should be the next step here');
         } catch (error) {
             console.error('Error sending next step message:', error);
         }
@@ -154,62 +348,128 @@ function createWindow() {
 }
 
 async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'interview', language = 'en-US') {
-    const client = new GoogleGenAI({
-        vertexai: false,
-        apiKey: apiKey,
-    });
+    console.log('Initializing Gemini session...');
+    
+    if (!apiKey || apiKey.trim().length === 0) {
+        console.error('API key is empty or undefined');
+        dialog.showErrorBox(
+            'Invalid API Key',
+            'Please enter a valid Gemini API key in the settings.'
+        );
+        return false;
+    }
+
+    // Clean the API key and check format
+    const cleanedKey = apiKey.trim();
+    console.log('API key format check:');
+    console.log('- Length:', cleanedKey.length);
+    console.log('- Starts with:', cleanedKey.substring(0, 3) + '...');
+    console.log('- Ends with:', '...' + cleanedKey.substring(cleanedKey.length - 3));
+    console.log('- Contains spaces:', cleanedKey.includes(' '));
+    console.log('- Contains newlines:', cleanedKey.includes('\n'));
+    
+    // Validate key format (should be AIza...)
+    if (!cleanedKey.startsWith('AIza')) {
+        dialog.showErrorBox(
+            'Invalid API Key Format',
+            'The API key should start with "AIza". Please make sure you\'re using a Gemini API key from Google AI Studio (https://aistudio.google.com/apikey).'
+        );
+        return false;
+    }
 
     const systemPrompt = getSystemPrompt(profile, customPrompt);
+    console.log('Using system prompt:', systemPrompt);
 
     try {
-        const session = await client.live.connect({
-            model: 'gemini-2.0-flash-live-001',
-            callbacks: {
-                onopen: function () {
-                    sendToRenderer('update-status', 'Connected to Gemini - Starting recording...');
-                },
-                onmessage: function (message) {
-                    console.log(message);
-                    if (message.serverContent?.modelTurn?.parts) {
-                        for (const part of message.serverContent.modelTurn.parts) {
-                            console.log(part);
-                            if (part.text) {
-                                messageBuffer += part.text;
-                            }
+        // Initialize session manager with callbacks
+        sessionManager.initialize(cleanedKey, systemPrompt, language, {
+            onopen: () => {
+                sendToRenderer('update-status', 'Connected to Gemini - Starting recording...');
+            },
+            onmessage: (message) => {
+                console.log('Received message from Gemini:', message);
+                
+                if (message.serverContent?.modelTurn?.parts) {
+                    console.log('Processing model turn parts...');
+                    for (const part of message.serverContent.modelTurn.parts) {
+                        if (part.text) {
+                            console.log('Adding text to buffer:', part.text);
+                            messageBuffer += part.text;
                         }
                     }
+                }
 
-                    if (message.serverContent?.generationComplete) {
-                        sendToRenderer('update-response', messageBuffer);
-                        messageBuffer = '';
-                    }
+                if (message.serverContent?.generationComplete) {
+                    console.log('Generation complete, sending response:', messageBuffer);
+                    sendToRenderer('update-response', messageBuffer);
+                    messageBuffer = '';
+                }
 
-                    if (message.serverContent?.turnComplete) {
-                        sendToRenderer('update-status', 'Listening...');
-                    }
-                },
-                onerror: function (e) {
-                    console.debug('Error:', e.message);
-                    sendToRenderer('update-status', 'Error: ' + e.message);
-                },
-                onclose: function (e) {
-                    console.debug('Session closed:', e.reason);
-                    sendToRenderer('update-status', 'Session closed');
-                },
+                if (message.serverContent?.turnComplete) {
+                    console.log('Turn complete, updating status');
+                    sendToRenderer('update-status', 'Listening...');
+                }
             },
-            config: {
-                responseModalities: ['TEXT'],
-                speechConfig: { languageCode: language },
-                systemInstruction: {
-                    parts: [{ text: systemPrompt }],
-                },
+            onerror: (error) => {
+                console.error('Gemini connection error:', error);
+                sendToRenderer('update-status', 'Error: ' + error.message);
+                dialog.showErrorBox(
+                    'Gemini Error',
+                    'Error connecting to Gemini API: ' + error.message
+                );
             },
+            onclose: (event) => {
+                console.error('Session closed with reason:', event.reason);
+                sendToRenderer('update-status', 'Session closed');
+                
+                if (event.reason.includes('API key not valid')) {
+                    dialog.showErrorBox(
+                        'Invalid API Key',
+                        'The API key was rejected by Google. Please make sure:\n\n' +
+                        '1. You\'re using a Gemini API key from Google AI Studio\n' +
+                        '2. The key is copied correctly without extra spaces\n' +
+                        '3. The key starts with "AIza"\n' +
+                        '4. You have enabled the Gemini API in your Google Cloud Console\n\n' +
+                        'Get a new key at: https://aistudio.google.com/apikey'
+                    );
+                }
+            },
+            onMaxReconnectAttemptsReached: () => {
+                dialog.showErrorBox(
+                    'Connection Error',
+                    'Failed to maintain connection with Gemini API after multiple attempts. Please check your internet connection and try again.'
+                );
+            },
+            onAuthError: (error) => {
+                dialog.showErrorBox(
+                    'Authentication Error',
+                    'Failed to authenticate with Gemini API. Please check your API key and try again.'
+                );
+            }
         });
 
-        geminiSession = session;
+        // Start the initial session
+        await sessionManager.startNewSession();
         return true;
     } catch (error) {
         console.error('Failed to initialize Gemini session:', error);
+        console.error('Error details:', {
+            name: error.name,
+            message: error.message,
+            stack: error.stack
+        });
+        
+        let errorMessage = 'Failed to connect to Gemini API. ';
+        if (error.message.includes('API key')) {
+            errorMessage += 'The API key appears to be invalid. Please make sure you\'ve copied the entire key correctly from Google AI Studio (https://aistudio.google.com/apikey).';
+        } else {
+            errorMessage += 'Please check your API key and internet connection.';
+        }
+        
+        dialog.showErrorBox(
+            'Connection Error',
+            errorMessage
+        );
         return false;
     }
 }
@@ -221,126 +481,101 @@ function sendToRenderer(channel, data) {
     }
 }
 
-function startMacOSAudioCapture() {
-    if (process.platform !== 'darwin') return false;
-
-    console.log('Starting macOS audio capture with SystemAudioDump...');
-
-    let systemAudioPath;
-    if (app.isPackaged) {
-        systemAudioPath = path.join(process.resourcesPath, 'SystemAudioDump');
-    } else {
-        systemAudioPath = path.join(__dirname, 'SystemAudioDump');
-    }
-
-    console.log('SystemAudioDump path:', systemAudioPath);
-
-    systemAudioProc = spawn(systemAudioPath, [], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    if (!systemAudioProc.pid) {
-        console.error('Failed to start SystemAudioDump');
-        return false;
-    }
-
-    console.log('SystemAudioDump started with PID:', systemAudioProc.pid);
-
-    const CHUNK_DURATION = 0.1;
-    const SAMPLE_RATE = 24000;
-    const BYTES_PER_SAMPLE = 2;
-    const CHANNELS = 2;
-    const CHUNK_SIZE = SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS * CHUNK_DURATION;
-
-    let audioBuffer = Buffer.alloc(0);
-
-    systemAudioProc.stdout.on('data', data => {
-        audioBuffer = Buffer.concat([audioBuffer, data]);
-
-        while (audioBuffer.length >= CHUNK_SIZE) {
-            const chunk = audioBuffer.slice(0, CHUNK_SIZE);
-            audioBuffer = audioBuffer.slice(CHUNK_SIZE);
-
-            const monoChunk = CHANNELS === 2 ? convertStereoToMono(chunk) : chunk;
-            const base64Data = monoChunk.toString('base64');
-            sendAudioToGemini(base64Data);
-
-            if (process.env.DEBUG_AUDIO) {
-                console.log(`Processed audio chunk: ${chunk.length} bytes`);
-                saveDebugAudio(monoChunk, 'system_audio');
-            }
-        }
-
-        const maxBufferSize = SAMPLE_RATE * BYTES_PER_SAMPLE * 1;
-        if (audioBuffer.length > maxBufferSize) {
-            audioBuffer = audioBuffer.slice(-maxBufferSize);
-        }
-    });
-
-    systemAudioProc.stderr.on('data', data => {
-        console.error('SystemAudioDump stderr:', data.toString());
-    });
-
-    systemAudioProc.on('close', code => {
-        console.log('SystemAudioDump process closed with code:', code);
-        systemAudioProc = null;
-    });
-
-    systemAudioProc.on('error', err => {
-        console.error('SystemAudioDump process error:', err);
-        systemAudioProc = null;
-    });
-
-    return true;
-}
-
-function convertStereoToMono(stereoBuffer) {
-    const samples = stereoBuffer.length / 4;
-    const monoBuffer = Buffer.alloc(samples * 2);
-
-    for (let i = 0; i < samples; i++) {
-        const leftSample = stereoBuffer.readInt16LE(i * 4);
-        monoBuffer.writeInt16LE(leftSample, i * 2);
-    }
-
-    return monoBuffer;
-}
-
-function stopMacOSAudioCapture() {
-    if (systemAudioProc) {
-        console.log('Stopping SystemAudioDump...');
-        systemAudioProc.kill('SIGTERM');
-        systemAudioProc = null;
-    }
-}
-
 async function sendAudioToGemini(base64Data) {
-    if (!geminiSession) return;
-
     try {
-        process.stdout.write('.');
-        await geminiSession.sendRealtimeInput({
-            audio: {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            },
-        });
+        await sessionManager.sendAudio(base64Data, 'audio/pcm;rate=24000');
+        sendToRenderer('update-listening-state', true);
     } catch (error) {
         console.error('Error sending audio to Gemini:', error);
+        sendToRenderer('update-listening-state', false);
     }
 }
 
-app.whenReady().then(createWindow);
+app.setName('Julie');
+app.setAppUserModelId('com.julie.app');
+
+app.on('ready', async () => {
+    // Set the app's name and info for system dialogs
+    app.setName('Julie');
+    
+    // On macOS, register the app for screen capture
+    if (process.platform === 'darwin') {
+        // Request screen capture access first
+        const screenCaptureAccess = systemPreferences.getMediaAccessStatus('screen');
+        if (screenCaptureAccess !== 'granted') {
+            dialog.showMessageBox({
+                type: 'info',
+                title: 'Screen Recording Permission Required',
+                message: 'Julie needs screen recording permission.',
+                detail: 'Please follow these steps:\n\n' +
+                       '1. Keep Julie running\n' +
+                       '2. Open System Settings > Privacy & Security > Screen Recording\n' +
+                       '3. Find and enable "Julie"\n' +
+                       '4. Return to Julie and try again',
+                buttons: ['Open Settings', 'Cancel'],
+                defaultId: 0
+            }).then(result => {
+                if (result.response === 0) {
+                    shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+                }
+                app.quit();
+            });
+            return;
+        }
+
+        // Then request microphone access
+        try {
+            const micAccess = await systemPreferences.askForMediaAccess('microphone');
+            if (!micAccess) {
+                dialog.showMessageBox({
+                    type: 'info',
+                    title: 'Microphone Permission Required',
+                    message: 'Julie needs microphone access.',
+                    detail: 'Please follow these steps:\n\n' +
+                           '1. Keep Julie running\n' +
+                           '2. Open System Settings > Privacy & Security > Microphone\n' +
+                           '3. Find and enable "Julie"\n' +
+                           '4. Return to Julie and try again',
+                    buttons: ['Open Settings', 'Cancel'],
+                    defaultId: 0
+                }).then(result => {
+                    if (result.response === 0) {
+                        shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone');
+                    }
+                    app.quit();
+                });
+                return;
+            }
+        } catch (error) {
+            console.error('Microphone permission error:', error);
+            dialog.showErrorBox(
+                'Permission Error',
+                'Failed to request microphone permission. Please check System Settings > Privacy & Security > Microphone and ensure Julie is enabled.'
+            );
+            app.quit();
+            return;
+        }
+    }
+
+    if (await checkRequirements()) {
+        createWindow();
+    } else {
+        dialog.showErrorBox(
+            'Setup Failed',
+            'Failed to meet all requirements. Please check the error messages and try again.'
+        );
+        app.quit();
+    }
+});
 
 app.on('window-all-closed', () => {
-    stopMacOSAudioCapture();
     if (process.platform !== 'darwin') {
         app.quit();
     }
 });
 
 app.on('before-quit', () => {
-    stopMacOSAudioCapture();
+    // Clean up any resources
 });
 
 app.on('activate', () => {
@@ -354,12 +589,9 @@ ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, profile 
 });
 
 ipcMain.handle('send-audio-content', async (event, { data, mimeType }) => {
-    if (!geminiSession) return { success: false, error: 'No active Gemini session' };
+    if (!sessionManager) return { success: false, error: 'No active Gemini session' };
     try {
-        process.stdout.write('.');
-        await geminiSession.sendRealtimeInput({
-            audio: { data: data, mimeType: mimeType },
-        });
+        await sendAudioToGemini(data);
         return { success: true };
     } catch (error) {
         console.error('Error sending audio:', error);
@@ -368,7 +600,7 @@ ipcMain.handle('send-audio-content', async (event, { data, mimeType }) => {
 });
 
 ipcMain.handle('send-image-content', async (event, { data, debug }) => {
-    if (!geminiSession) return { success: false, error: 'No active Gemini session' };
+    if (!sessionManager) return { success: false, error: 'No active Gemini session' };
 
     try {
         if (!data || typeof data !== 'string') {
@@ -384,9 +616,7 @@ ipcMain.handle('send-image-content', async (event, { data, debug }) => {
         }
 
         process.stdout.write('!');
-        await geminiSession.sendRealtimeInput({
-            media: { data: data, mimeType: 'image/jpeg' },
-        });
+        await sessionManager.sendMedia(data, 'image/jpeg');
 
         return { success: true };
     } catch (error) {
@@ -396,15 +626,13 @@ ipcMain.handle('send-image-content', async (event, { data, debug }) => {
 });
 
 ipcMain.handle('send-text-message', async (event, text) => {
-    if (!geminiSession) return { success: false, error: 'No active Gemini session' };
-
     try {
         if (!text || typeof text !== 'string' || text.trim().length === 0) {
             return { success: false, error: 'Invalid text message' };
         }
 
         console.log('Sending text message:', text);
-        await geminiSession.sendRealtimeInput({ text: text.trim() });
+        await sessionManager.sendMessage(text.trim());
         return { success: true };
     } catch (error) {
         console.error('Error sending text:', error);
@@ -412,43 +640,9 @@ ipcMain.handle('send-text-message', async (event, text) => {
     }
 });
 
-ipcMain.handle('start-macos-audio', async event => {
-    if (process.platform !== 'darwin') {
-        return {
-            success: false,
-            error: 'macOS audio capture only available on macOS',
-        };
-    }
-
-    try {
-        const success = startMacOSAudioCapture();
-        return { success };
-    } catch (error) {
-        console.error('Error starting macOS audio capture:', error);
-        return { success: false, error: error.message };
-    }
-});
-
-ipcMain.handle('stop-macos-audio', async event => {
-    try {
-        stopMacOSAudioCapture();
-        return { success: true };
-    } catch (error) {
-        console.error('Error stopping macOS audio capture:', error);
-        return { success: false, error: error.message };
-    }
-});
-
 ipcMain.handle('close-session', async event => {
     try {
-        stopMacOSAudioCapture();
-
-        // Cleanup any pending resources and stop audio/video capture
-        if (geminiSession) {
-            await geminiSession.close();
-            geminiSession = null;
-        }
-
+        await sessionManager.closeCurrentSession();
         return { success: true };
     } catch (error) {
         console.error('Error closing session:', error);
@@ -458,7 +652,6 @@ ipcMain.handle('close-session', async event => {
 
 ipcMain.handle('quit-application', async event => {
     try {
-        stopMacOSAudioCapture();
         app.quit();
         return { success: true };
     } catch (error) {
@@ -474,5 +667,27 @@ ipcMain.handle('open-external', async (event, url) => {
     } catch (error) {
         console.error('Error opening external URL:', error);
         return { success: false, error: error.message };
+    }
+});
+
+ipcMain.handle('check-permissions', async () => {
+    try {
+        return await checkPermissionStatus();
+    } catch (error) {
+        console.error('Error checking permissions:', error);
+        return {
+            screen: {
+                status: 'unknown',
+                authorized: false,
+                appName: app.getName(),
+                error: error.message
+            },
+            microphone: {
+                status: 'unknown',
+                authorized: false,
+                appName: app.getName(),
+                error: error.message
+            }
+        };
     }
 });

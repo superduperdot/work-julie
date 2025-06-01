@@ -4,6 +4,10 @@ const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 module.exports = {
     packagerConfig: {
         asar: true,
+        icon: './assets/icon',
+        appBundleId: 'com.julie.app',
+        productName: 'Julie',
+        shortcutName: 'Julie',
         extraResource: ['./src/SystemAudioDump'],
     },
     rebuildConfig: {},
@@ -11,9 +15,9 @@ module.exports = {
         {
             name: '@electron-forge/maker-squirrel',
             config: {
-                name: 'cheating-daddy',
-                productName: 'Cheating Daddy',
-                shortcutName: 'Cheating Daddy',
+                name: 'julie',
+                productName: 'Julie',
+                shortcutName: 'Julie',
                 createDesktopShortcut: true,
                 createStartMenuShortcut: true,
             },

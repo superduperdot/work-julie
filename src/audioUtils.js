@@ -1,5 +1,14 @@
 const fs = require('fs');
 const path = require('path');
+const logger = require('./logger');
+
+// Audio level thresholds
+const AUDIO_THRESHOLDS = {
+    SILENCE: 100,    // Absolute value below this is considered silence
+    LOW: 1000,       // Low audio level
+    NORMAL: 5000,    // Normal audio level
+    HIGH: 20000      // High audio level
+};
 
 // Convert raw PCM to WAV format for easier playback and verification
 function pcmToWav(pcmBuffer, outputPath, sampleRate = 24000, channels = 1, bitDepth = 16) {
@@ -34,11 +43,25 @@ function pcmToWav(pcmBuffer, outputPath, sampleRate = 24000, channels = 1, bitDe
 
     // Write to file
     fs.writeFileSync(outputPath, wavBuffer);
+    logger.debug('WAV file created', { path: outputPath, size: wavBuffer.length });
 
     return outputPath;
 }
 
-// Analyze audio buffer for debugging
+// Calculate audio level from buffer
+function calculateAudioLevel(buffer) {
+    const int16Array = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
+    let maxValue = 0;
+    
+    for (let i = 0; i < int16Array.length; i++) {
+        maxValue = Math.max(maxValue, Math.abs(int16Array[i]));
+    }
+
+    // Convert to percentage (0-100)
+    return Math.min(100, (maxValue / 32768) * 100);
+}
+
+// Analyze audio buffer for debugging and metrics
 function analyzeAudioBuffer(buffer, label = 'Audio') {
     const int16Array = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
 
@@ -47,46 +70,67 @@ function analyzeAudioBuffer(buffer, label = 'Audio') {
     let avgValue = 0;
     let rmsValue = 0;
     let silentSamples = 0;
+    let peakCount = 0;
 
     for (let i = 0; i < int16Array.length; i++) {
-        const sample = int16Array[i];
+        const sample = Math.abs(int16Array[i]);
         minValue = Math.min(minValue, sample);
         maxValue = Math.max(maxValue, sample);
         avgValue += sample;
         rmsValue += sample * sample;
 
-        if (Math.abs(sample) < 100) {
+        if (sample < AUDIO_THRESHOLDS.SILENCE) {
             silentSamples++;
+        }
+        if (sample > AUDIO_THRESHOLDS.HIGH) {
+            peakCount++;
         }
     }
 
     avgValue /= int16Array.length;
     rmsValue = Math.sqrt(rmsValue / int16Array.length);
-
     const silencePercentage = (silentSamples / int16Array.length) * 100;
+    const audioLevel = calculateAudioLevel(buffer);
 
-    console.log(`${label} Analysis:`);
-    console.log(`  Samples: ${int16Array.length}`);
-    console.log(`  Min: ${minValue}, Max: ${maxValue}`);
-    console.log(`  Average: ${avgValue.toFixed(2)}`);
-    console.log(`  RMS: ${rmsValue.toFixed(2)}`);
-    console.log(`  Silence: ${silencePercentage.toFixed(1)}%`);
-    console.log(`  Dynamic Range: ${20 * Math.log10(maxValue / (rmsValue || 1))} dB`);
-
-    return {
+    const metrics = {
+        label,
+        samples: int16Array.length,
         minValue,
         maxValue,
-        avgValue,
-        rmsValue,
-        silencePercentage,
-        sampleCount: int16Array.length,
+        avgValue: avgValue.toFixed(2),
+        rmsValue: rmsValue.toFixed(2),
+        silencePercentage: silencePercentage.toFixed(1),
+        dynamicRange: (20 * Math.log10(maxValue / (rmsValue || 1))).toFixed(2),
+        audioLevel: audioLevel.toFixed(1),
+        peakCount,
+        quality: getAudioQuality(maxValue, silencePercentage)
     };
+
+    logger.logAudioMetrics(metrics);
+    return metrics;
+}
+
+// Determine audio quality based on metrics
+function getAudioQuality(maxValue, silencePercentage) {
+    if (maxValue < AUDIO_THRESHOLDS.LOW) {
+        return 'very-low';
+    } else if (maxValue < AUDIO_THRESHOLDS.NORMAL) {
+        return 'low';
+    } else if (silencePercentage > 90) {
+        return 'mostly-silent';
+    } else if (silencePercentage > 50) {
+        return 'partially-silent';
+    } else if (maxValue > AUDIO_THRESHOLDS.HIGH) {
+        return 'high';
+    } else {
+        return 'good';
+    }
 }
 
 // Save audio buffer with metadata for debugging
 function saveDebugAudio(buffer, type, timestamp = Date.now()) {
     const homeDir = require('os').homedir();
-    const debugDir = path.join(homeDir, 'cheddar', 'debug');
+    const debugDir = path.join(homeDir, 'julie', 'debug');
 
     if (!fs.existsSync(debugDir)) {
         fs.mkdirSync(debugDir, { recursive: true });
@@ -96,40 +140,46 @@ function saveDebugAudio(buffer, type, timestamp = Date.now()) {
     const wavPath = path.join(debugDir, `${type}_${timestamp}.wav`);
     const metaPath = path.join(debugDir, `${type}_${timestamp}.json`);
 
-    // Save raw PCM
-    fs.writeFileSync(pcmPath, buffer);
+    try {
+        // Save raw PCM
+        fs.writeFileSync(pcmPath, buffer);
 
-    // Convert to WAV for easy playback
-    pcmToWav(buffer, wavPath);
+        // Convert to WAV for easy playback
+        pcmToWav(buffer, wavPath);
 
-    // Analyze and save metadata
-    const analysis = analyzeAudioBuffer(buffer, type);
-    fs.writeFileSync(
-        metaPath,
-        JSON.stringify(
-            {
-                timestamp,
-                type,
-                bufferSize: buffer.length,
-                analysis,
-                format: {
-                    sampleRate: 24000,
-                    channels: 1,
-                    bitDepth: 16,
+        // Analyze and save metadata
+        const analysis = analyzeAudioBuffer(buffer, type);
+        fs.writeFileSync(
+            metaPath,
+            JSON.stringify(
+                {
+                    timestamp,
+                    type,
+                    bufferSize: buffer.length,
+                    analysis,
+                    format: {
+                        sampleRate: 24000,
+                        channels: 1,
+                        bitDepth: 16,
+                    },
                 },
-            },
-            null,
-            2
-        )
-    );
+                null,
+                2
+            )
+        );
 
-    console.log(`Debug audio saved: ${wavPath}`);
-
-    return { pcmPath, wavPath, metaPath };
+        logger.info('Debug audio saved', { type, paths: { pcm: pcmPath, wav: wavPath, meta: metaPath } });
+        return { pcmPath, wavPath, metaPath };
+    } catch (error) {
+        logger.error('Failed to save debug audio', error);
+        throw error;
+    }
 }
 
 module.exports = {
     pcmToWav,
     analyzeAudioBuffer,
     saveDebugAudio,
+    calculateAudioLevel,
+    AUDIO_THRESHOLDS
 };

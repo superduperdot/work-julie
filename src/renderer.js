@@ -1,373 +1,527 @@
 // renderer.js
 const { ipcRenderer } = require('electron');
+const { dialog } = require('electron');
 
-let mediaStream = null;
-let screenshotInterval = null;
-let audioContext = null;
-let audioProcessor = null;
-let micAudioProcessor = null;
-let audioBuffer = [];
-const SAMPLE_RATE = 24000;
-const AUDIO_CHUNK_DURATION = 0.1; // seconds
-const BUFFER_SIZE = 4096; // Increased buffer size for smoother audio
-
-let hiddenVideo = null;
-let offscreenCanvas = null;
-let offscreenContext = null;
-
-const isLinux = process.platform === 'linux';
-const isMacOS = process.platform === 'darwin';
-
-function cheddarElement() {
-    return document.getElementById('cheddar');
-}
-
-function convertFloat32ToInt16(float32Array) {
-    const int16Array = new Int16Array(float32Array.length);
-    for (let i = 0; i < float32Array.length; i++) {
-        // Improved scaling to prevent clipping
-        const s = Math.max(-1, Math.min(1, float32Array[i]));
-        int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+// Constants
+const AUDIO_CONFIG = {
+    sampleRate: 24000,
+    bufferSize: 4096,
+    captureInterval: 1000, // Screenshot capture interval in ms
+    constraints: {
+        audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 24000
+        }
+    },
+    screenCapture: {
+        video: {
+            frameRate: 1,
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+        },
+        audio: false
     }
-    return int16Array;
-}
+};
 
-function arrayBufferToBase64(buffer) {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
+// State management
+const state = {
+    mediaStream: null,
+    screenshotInterval: null,
+    audioContext: null,
+    audioProcessor: null,
+    microphoneStream: null,
+    hiddenVideo: null,
+    offscreenCanvas: null,
+    offscreenContext: null,
+    isCapturing: false
+};
+
+// Platform detection
+const platform = {
+    isLinux: process.platform === 'linux',
+    isMacOS: process.platform === 'darwin'
+};
+
+// UI Elements
+class JulieUI {
+    static element() {
+        return document.getElementById('julie');
     }
-    return btoa(binary);
-}
 
-async function initializeGemini(profile = 'interview', language = 'en-US') {
-    const apiKey = localStorage.getItem('apiKey')?.trim();
-    if (apiKey) {
-        const success = await ipcRenderer.invoke('initialize-gemini', apiKey, localStorage.getItem('customPrompt') || '', profile, language);
-        if (success) {
-            cheddar.e().setStatus('Live');
-        } else {
-            cheddar.e().setStatus('error');
+    static updateStatus(status) {
+        const el = this.element();
+        if (el) {
+            el.setStatus(status);
+            console.log('Status update:', status);
+        }
+    }
+
+    static updateAudioStatus(status) {
+        const el = this.element();
+        if (el) {
+            el.updateAudioStatus(status);
+            console.log('Audio status update:', status);
+        }
+    }
+
+    static updatePermissionStatus(type, status) {
+        const el = this.element();
+        if (el) {
+            el.updatePermissionStatus(type, status);
+            console.log('Permission status update:', type, status);
         }
     }
 }
 
-// Listen for status updates
-ipcRenderer.on('update-status', (event, status) => {
-    console.log('Status update:', status);
-    cheddar.e().setStatus(status);
-});
+// Audio Processing
+class AudioProcessor {
+    static async startMicrophoneCapture() {
+        try {
+            console.log('Requesting microphone access...');
+            state.microphoneStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONFIG.constraints);
+            
+            console.log('Creating audio context...');
+            state.audioContext = new AudioContext({
+                sampleRate: AUDIO_CONFIG.sampleRate
+            });
+            
+            const source = state.audioContext.createMediaStreamSource(state.microphoneStream);
+            state.audioProcessor = state.audioContext.createScriptProcessor(AUDIO_CONFIG.bufferSize, 1, 1);
 
-// Listen for responses
-ipcRenderer.on('update-response', (event, response) => {
-    console.log('Gemini response:', response);
-    cheddar.e().setResponse(response);
-    // You can add UI elements to display the response if needed
-});
+            console.log('Setting up audio processing...');
+            state.audioProcessor.onaudioprocess = this.handleAudioProcess;
 
-async function startCapture() {
-    try {
-        if (isMacOS) {
-            // On macOS, use SystemAudioDump for audio and getDisplayMedia for screen
-            console.log('Starting macOS capture with SystemAudioDump...');
+            source.connect(state.audioProcessor);
+            state.audioProcessor.connect(state.audioContext.destination);
 
-            // Start macOS audio capture
-            const audioResult = await ipcRenderer.invoke('start-macos-audio');
-            if (!audioResult.success) {
-                throw new Error('Failed to start macOS audio capture: ' + audioResult.error);
+            console.log('Microphone capture started');
+            JulieUI.updateStatus('Microphone active');
+            JulieUI.updateAudioStatus({ 
+                active: true,
+                source: 'microphone'
+            });
+
+            return true;
+        } catch (error) {
+            console.error('Error starting microphone capture:', error);
+            JulieUI.updateStatus(`Microphone error: ${error.message}`);
+            return false;
+        }
+    }
+
+    static async handleAudioProcess(e) {
+        try {
+            const inputData = e.inputBuffer.getChannelData(0);
+            const pcmData = AudioProcessor.convertFloat32ToInt16(inputData);
+            const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+            
+            const result = await ipcRenderer.invoke('send-audio-content', {
+                data: base64Data,
+                mimeType: 'audio/pcm;rate=24000'
+            });
+
+            if (!result.success) {
+                console.error('Failed to send audio:', result.error);
+            }
+        } catch (error) {
+            console.error('Audio processing error:', error);
+        }
+    }
+
+    static convertFloat32ToInt16(float32Array) {
+        const int16Array = new Int16Array(float32Array.length);
+        for (let i = 0; i < float32Array.length; i++) {
+            const s = Math.max(-1, Math.min(1, float32Array[i]));
+            int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        return int16Array;
+    }
+
+    static stop() {
+        console.log('Stopping audio capture...');
+        
+        if (state.audioProcessor) {
+            state.audioProcessor.disconnect();
+            state.audioProcessor = null;
+        }
+
+        if (state.audioContext) {
+            state.audioContext.close();
+            state.audioContext = null;
+        }
+
+        if (state.microphoneStream) {
+            state.microphoneStream.getTracks().forEach(track => track.stop());
+            state.microphoneStream = null;
+        }
+
+        JulieUI.updateStatus('Audio capture stopped');
+        JulieUI.updateAudioStatus({ active: false });
+    }
+}
+
+// Screen Capture
+class ScreenCapture {
+    static async start() {
+        try {
+            console.log('Starting screen capture...');
+            state.mediaStream = await navigator.mediaDevices.getDisplayMedia(AUDIO_CONFIG.screenCapture);
+            
+            // Start capturing screenshots
+            state.screenshotInterval = setInterval(this.captureScreenshot, AUDIO_CONFIG.captureInterval);
+            setTimeout(this.captureScreenshot, 100); // Immediate first capture
+            
+            return true;
+        } catch (error) {
+            console.error('Screen capture error:', error);
+            return false;
+        }
+    }
+
+    static async captureScreenshot() {
+        if (!state.mediaStream) return;
+
+        try {
+            // Lazy initialization of video element
+            if (!state.hiddenVideo) {
+                await ScreenCapture.initializeVideoElement();
             }
 
-            // Get screen capture for screenshots
-            mediaStream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    frameRate: 1,
-                    width: { ideal: 1920 },
-                    height: { ideal: 1080 },
-                },
-                audio: false, // Don't use browser audio on macOS
-            });
-
-            console.log('macOS screen capture started - audio handled by SystemAudioDump');
-        } else if (isLinux) {
-            // Linux - use display media for screen capture and getUserMedia for microphone
-            mediaStream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    frameRate: 1,
-                    width: { ideal: 1920 },
-                    height: { ideal: 1080 },
-                },
-                audio: false, // Don't use system audio loopback on Linux
-            });
-
-            // Get microphone input for Linux
-            let micStream = null;
-            try {
-                micStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        sampleRate: SAMPLE_RATE,
-                        channelCount: 1,
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true,
-                    },
-                    video: false,
-                });
-
-                console.log('Linux microphone capture started');
-
-                // Setup audio processing for microphone on Linux
-                setupLinuxMicProcessing(micStream);
-            } catch (micError) {
-                console.warn('Failed to get microphone access on Linux:', micError);
-                // Continue without microphone if permission denied
-            }
-
-            console.log('Linux screen capture started');
-        } else {
-            // Windows - use display media with loopback for system audio
-            mediaStream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    frameRate: 1,
-                    width: { ideal: 1920 },
-                    height: { ideal: 1080 },
-                },
-                audio: {
-                    sampleRate: SAMPLE_RATE,
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                },
-            });
-
-            console.log('Windows capture started with loopback audio');
-
-            // Setup audio processing for Windows loopback audio only
-            setupWindowsLoopbackProcessing();
-        }
-
-        console.log('MediaStream obtained:', {
-            hasVideo: mediaStream.getVideoTracks().length > 0,
-            hasAudio: mediaStream.getAudioTracks().length > 0,
-            videoTrack: mediaStream.getVideoTracks()[0]?.getSettings(),
-        });
-
-        // Start capturing screenshots every second
-        screenshotInterval = setInterval(captureScreenshot, 1000);
-
-        // Capture first screenshot immediately
-        setTimeout(captureScreenshot, 100);
-    } catch (err) {
-        console.error('Error starting capture:', err);
-        cheddar.e().setStatus('error');
-    }
-}
-
-function setupLinuxMicProcessing(micStream) {
-    // Setup microphone audio processing for Linux
-    const micAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-    const micSource = micAudioContext.createMediaStreamSource(micStream);
-    const micProcessor = micAudioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
-
-    let audioBuffer = [];
-    const samplesPerChunk = SAMPLE_RATE * AUDIO_CHUNK_DURATION;
-
-    micProcessor.onaudioprocess = async e => {
-        const inputData = e.inputBuffer.getChannelData(0);
-        audioBuffer.push(...inputData);
-
-        // Process audio in chunks
-        while (audioBuffer.length >= samplesPerChunk) {
-            const chunk = audioBuffer.splice(0, samplesPerChunk);
-            const pcmData16 = convertFloat32ToInt16(chunk);
-            const base64Data = arrayBufferToBase64(pcmData16.buffer);
-
-            await ipcRenderer.invoke('send-audio-content', {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            });
-        }
-    };
-
-    micSource.connect(micProcessor);
-    micProcessor.connect(micAudioContext.destination);
-
-    // Store processor reference for cleanup
-    audioProcessor = micProcessor;
-}
-
-function setupWindowsLoopbackProcessing() {
-    // Setup audio processing for Windows loopback audio only
-    audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-    const source = audioContext.createMediaStreamSource(mediaStream);
-    audioProcessor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
-
-    let audioBuffer = [];
-    const samplesPerChunk = SAMPLE_RATE * AUDIO_CHUNK_DURATION;
-
-    audioProcessor.onaudioprocess = async e => {
-        const inputData = e.inputBuffer.getChannelData(0);
-        audioBuffer.push(...inputData);
-
-        // Process audio in chunks
-        while (audioBuffer.length >= samplesPerChunk) {
-            const chunk = audioBuffer.splice(0, samplesPerChunk);
-            const pcmData16 = convertFloat32ToInt16(chunk);
-            const base64Data = arrayBufferToBase64(pcmData16.buffer);
-
-            await ipcRenderer.invoke('send-audio-content', {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            });
-        }
-    };
-
-    source.connect(audioProcessor);
-    audioProcessor.connect(audioContext.destination);
-}
-
-async function captureScreenshot() {
-    console.log('Capturing screenshot...');
-    if (!mediaStream) return;
-
-    // Lazy init of video element
-    if (!hiddenVideo) {
-        hiddenVideo = document.createElement('video');
-        hiddenVideo.srcObject = mediaStream;
-        hiddenVideo.muted = true;
-        hiddenVideo.playsInline = true;
-        await hiddenVideo.play();
-
-        await new Promise(resolve => {
-            if (hiddenVideo.readyState >= 2) return resolve();
-            hiddenVideo.onloadedmetadata = () => resolve();
-        });
-
-        // Lazy init of canvas based on video dimensions
-        offscreenCanvas = document.createElement('canvas');
-        offscreenCanvas.width = hiddenVideo.videoWidth;
-        offscreenCanvas.height = hiddenVideo.videoHeight;
-        offscreenContext = offscreenCanvas.getContext('2d');
-    }
-
-    // Check if video is ready
-    if (hiddenVideo.readyState < 2) {
-        console.warn('Video not ready yet, skipping screenshot');
-        return;
-    }
-
-    offscreenContext.drawImage(hiddenVideo, 0, 0, offscreenCanvas.width, offscreenCanvas.height);
-
-    // Check if image was drawn properly by sampling a pixel
-    const imageData = offscreenContext.getImageData(0, 0, 1, 1);
-    const isBlank = imageData.data.every((value, index) => {
-        // Check if all pixels are black (0,0,0) or transparent
-        return index === 3 ? true : value === 0;
-    });
-
-    if (isBlank) {
-        console.warn('Screenshot appears to be blank/black');
-    }
-
-    offscreenCanvas.toBlob(
-        async blob => {
-            if (!blob) {
-                console.error('Failed to create blob from canvas');
+            // Ensure video is ready
+            if (state.hiddenVideo.readyState < 2) {
+                console.warn('Video not ready yet, skipping screenshot');
                 return;
             }
 
-            const reader = new FileReader();
-            reader.onloadend = async () => {
-                const base64data = reader.result.split(',')[1];
+            state.offscreenContext.drawImage(
+                state.hiddenVideo, 
+                0, 
+                0, 
+                state.offscreenCanvas.width, 
+                state.offscreenCanvas.height
+            );
 
-                // Validate base64 data
-                if (!base64data || base64data.length < 100) {
-                    console.error('Invalid base64 data generated');
-                    return;
-                }
+            // Quality check
+            if (ScreenCapture.isBlankImage()) {
+                console.warn('Screenshot appears to be blank/black');
+                return;
+            }
 
-                const result = await ipcRenderer.invoke('send-image-content', {
-                    data: base64data,
-                });
-
-                if (!result.success) {
-                    console.error('Failed to send image:', result.error);
-                }
-            };
-            reader.readAsDataURL(blob);
-        },
-        'image/jpeg',
-        0.8
-    );
-}
-
-function stopCapture() {
-    if (screenshotInterval) {
-        clearInterval(screenshotInterval);
-        screenshotInterval = null;
+            await ScreenCapture.sendScreenshot();
+        } catch (error) {
+            console.error('Screenshot capture error:', error);
+        }
     }
 
-    if (audioProcessor) {
-        audioProcessor.disconnect();
-        audioProcessor = null;
+    static async initializeVideoElement() {
+        state.hiddenVideo = document.createElement('video');
+        state.hiddenVideo.srcObject = state.mediaStream;
+        state.hiddenVideo.muted = true;
+        state.hiddenVideo.playsInline = true;
+        await state.hiddenVideo.play();
+
+        await new Promise(resolve => {
+            if (state.hiddenVideo.readyState >= 2) return resolve();
+            state.hiddenVideo.onloadedmetadata = () => resolve();
+        });
+
+        state.offscreenCanvas = document.createElement('canvas');
+        state.offscreenCanvas.width = state.hiddenVideo.videoWidth;
+        state.offscreenCanvas.height = state.hiddenVideo.videoHeight;
+        state.offscreenContext = state.offscreenCanvas.getContext('2d');
     }
 
-    if (audioContext) {
-        audioContext.close();
-        audioContext = null;
+    static isBlankImage() {
+        const imageData = state.offscreenContext.getImageData(0, 0, 1, 1);
+        return imageData.data.every((value, index) => index === 3 || value === 0);
     }
 
-    if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
-        mediaStream = null;
-    }
+    static async sendScreenshot() {
+        return new Promise((resolve, reject) => {
+            state.offscreenCanvas.toBlob(
+                async blob => {
+                    if (!blob) {
+                        reject(new Error('Failed to create blob from canvas'));
+                        return;
+                    }
 
-    // Stop macOS audio capture if running
-    if (isMacOS) {
-        ipcRenderer.invoke('stop-macos-audio').catch(err => {
-            console.error('Error stopping macOS audio:', err);
+                    const reader = new FileReader();
+                    reader.onloadend = async () => {
+                        try {
+                            const base64data = reader.result.split(',')[1];
+                            if (!base64data || base64data.length < 100) {
+                                throw new Error('Invalid base64 data generated');
+                            }
+
+                            const result = await ipcRenderer.invoke('send-image-content', {
+                                data: base64data
+                            });
+
+                            if (!result.success) {
+                                throw new Error(result.error);
+                            }
+
+                            resolve();
+                        } catch (error) {
+                            reject(error);
+                        }
+                    };
+                    reader.readAsDataURL(blob);
+                },
+                'image/jpeg',
+                0.8
+            );
         });
     }
 
-    // Clean up hidden elements
-    if (hiddenVideo) {
-        hiddenVideo.pause();
-        hiddenVideo.srcObject = null;
-        hiddenVideo = null;
+    static stop() {
+        if (state.screenshotInterval) {
+            clearInterval(state.screenshotInterval);
+            state.screenshotInterval = null;
+        }
+
+        if (state.mediaStream) {
+            state.mediaStream.getTracks().forEach(track => track.stop());
+            state.mediaStream = null;
+        }
+
+        if (state.hiddenVideo) {
+            state.hiddenVideo.pause();
+            state.hiddenVideo.srcObject = null;
+            state.hiddenVideo = null;
+        }
+
+        state.offscreenCanvas = null;
+        state.offscreenContext = null;
     }
-    offscreenCanvas = null;
-    offscreenContext = null;
 }
 
-// Send text message to Gemini
-async function sendTextMessage(text) {
-    if (!text || text.trim().length === 0) {
-        console.warn('Cannot send empty text message');
-        return { success: false, error: 'Empty message' };
+// Permission handling
+class PermissionManager {
+    static async checkAndRequestPermissions() {
+        if (!platform.isMacOS) {
+            return this.handleNonMacOSPermissions();
+        }
+
+        try {
+            console.log('Checking macOS permissions...');
+            const permissions = await ipcRenderer.invoke('check-permissions');
+            
+            // Update UI with current status
+            Object.entries(permissions).forEach(([type, status]) => {
+                JulieUI.updatePermissionStatus(type, status);
+            });
+
+            // If either permission is not authorized, show the permission request dialog
+            if (!permissions.screen.authorized || !permissions.microphone.authorized) {
+                const { dialog, shell } = require('@electron/remote');
+                
+                const result = await dialog.showMessageBox({
+                    type: 'info',
+                    title: 'Permissions Required',
+                    message: 'Julie needs the following permissions to work:',
+                    detail: 'Current Status:\n' +
+                           `Screen Recording: ${permissions.screen.status}\n` +
+                           `Microphone: ${permissions.microphone.status}\n\n` +
+                           'Please follow these steps:\n\n' +
+                           '1. Click "Open Settings" below\n' +
+                           '2. Find "Julie" in the list\n' +
+                           '3. Enable the permission\n' +
+                           '4. Return to Julie and click "Check Again"\n\n' +
+                           'Important: Keep Julie running while granting permissions!',
+                    buttons: ['Open Screen Recording Settings', 'Open Microphone Settings', 'Check Again', 'Cancel'],
+                    defaultId: 0
+                });
+
+                switch (result.response) {
+                    case 0: // Screen Recording
+                        shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+                        return false;
+                    case 1: // Microphone
+                        shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone');
+                        return false;
+                    case 2: // Check Again
+                        return await this.checkAndRequestPermissions();
+                    default: // Cancel
+                        return false;
+                }
+            }
+
+            console.log('All permissions granted');
+            return true;
+
+        } catch (error) {
+            console.error('Permission check failed:', error);
+            const { dialog } = require('@electron/remote');
+            dialog.showErrorBox(
+                'Permission Error',
+                `Failed to check permissions: ${error.message}\n\n` +
+                'Please ensure Julie has both Screen Recording and Microphone permissions in System Settings.'
+            );
+            return false;
+        }
+    }
+
+    static async handleNonMacOSPermissions() {
+        try {
+            // Request screen capture permission
+            const screenPermission = await navigator.permissions.query({ name: 'display-capture' });
+            JulieUI.updatePermissionStatus('screen', screenPermission.state);
+            
+            // Request microphone permission
+            const micPermission = await navigator.permissions.query({ name: 'microphone' });
+            JulieUI.updatePermissionStatus('microphone', micPermission.state);
+
+            if (screenPermission.state === 'denied' || micPermission.state === 'denied') {
+                throw new Error('Required permissions were denied');
+            }
+
+            // If permissions are not granted, request them
+            if (screenPermission.state === 'prompt' || micPermission.state === 'prompt') {
+                const { dialog } = require('@electron/remote');
+                const result = await dialog.showMessageBox({
+                    type: 'info',
+                    title: 'Permissions Required',
+                    message: 'Julie needs access to your screen and microphone.',
+                    detail: 'Please allow access when prompted by your browser.',
+                    buttons: ['Continue', 'Cancel'],
+                    defaultId: 0
+                });
+
+                if (result.response !== 0) {
+                    return false;
+                }
+
+                // Try to get microphone permission first
+                try {
+                    const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    micStream.getTracks().forEach(track => track.stop());
+                } catch (error) {
+                    console.error('Microphone permission denied:', error);
+                    return false;
+                }
+            }
+
+            return true;
+        } catch (error) {
+            console.error('Permission check failed:', error);
+            return false;
+        }
+    }
+}
+
+// Main capture control
+async function startCapture() {
+    try {
+        if (state.isCapturing) {
+            console.warn('Capture already in progress');
+            return false;
+        }
+
+        // Check permissions first
+        console.log('Checking permissions...');
+        const permissionsGranted = await PermissionManager.checkAndRequestPermissions();
+        if (!permissionsGranted) {
+            throw new Error('Required permissions not granted');
+        }
+
+        // Start audio capture
+        console.log('Starting audio capture...');
+        const micSuccess = await AudioProcessor.startMicrophoneCapture();
+        if (!micSuccess) {
+            throw new Error('Failed to start microphone capture');
+        }
+
+        // Start screen capture
+        console.log('Starting screen capture...');
+        const screenSuccess = await ScreenCapture.start();
+        if (!screenSuccess) {
+            AudioProcessor.stop();
+            throw new Error('Failed to start screen capture');
+        }
+
+        state.isCapturing = true;
+        JulieUI.updateStatus('Capture started');
+        return true;
+
+    } catch (error) {
+        console.error('Error starting capture:', error);
+        JulieUI.updateStatus('error');
+        
+        const { dialog } = require('@electron/remote');
+        dialog.showErrorBox('Capture Error', error.message);
+        return false;
+    }
+}
+
+function stopCapture() {
+    AudioProcessor.stop();
+    ScreenCapture.stop();
+    state.isCapturing = false;
+}
+
+// Initialize Gemini
+async function initializeGemini(profile = 'interview', language = 'en-US') {
+    const apiKey = localStorage.getItem('apiKey')?.trim();
+    console.log('Retrieved API key from localStorage, length:', apiKey?.length);
+    
+    if (!apiKey) {
+        console.error('No API key found in localStorage');
+        JulieUI.updateStatus('error');
+        return false;
     }
 
     try {
-        const result = await ipcRenderer.invoke('send-text-message', text);
-        if (result.success) {
-            console.log('Text message sent successfully');
+        console.log('Initializing Gemini with API key...');
+        const success = await ipcRenderer.invoke(
+            'initialize-gemini', 
+            apiKey, 
+            localStorage.getItem('customPrompt') || '', 
+            profile, 
+            language
+        );
+
+        if (success) {
+            console.log('Gemini initialization successful');
+            JulieUI.updateStatus('Live');
         } else {
-            console.error('Failed to send text message:', result.error);
+            console.error('Gemini initialization failed');
+            JulieUI.updateStatus('error');
         }
-        return result;
+        return success;
     } catch (error) {
-        console.error('Error sending text message:', error);
-        return { success: false, error: error.message };
+        console.error('Gemini initialization error:', error);
+        JulieUI.updateStatus('error');
+        return false;
     }
 }
 
-window.cheddar = {
+// Export functions and setup event listeners
+window.julie = {
     initializeGemini,
     startCapture,
     stopCapture,
-    sendTextMessage,
-    isLinux: isLinux,
-    isMacOS: isMacOS,
-    e: cheddarElement,
+    isLinux: platform.isLinux,
+    isMacOS: platform.isMacOS,
+    e: JulieUI.element
 };
+
+// Event listeners
+ipcRenderer.on('update-status', (event, status) => JulieUI.updateStatus(status));
+ipcRenderer.on('update-response', (event, response) => JulieUI.element()?.setResponse(response));
+ipcRenderer.on('update-permission-status', (event, { type, status }) => JulieUI.updatePermissionStatus(type, status));
+ipcRenderer.on('update-audio-status', (event, status) => JulieUI.updateAudioStatus(status));
+ipcRenderer.on('update-audio-metrics', (event, metrics) => {
+    const el = JulieUI.element();
+    if (el) {
+        if (metrics.audioLevel !== undefined) {
+            el.audioLevel = parseFloat(metrics.audioLevel);
+        }
+        if (metrics.quality) {
+            el.audioQuality = metrics.quality;
+        }
+        el.requestUpdate();
+    }
+});
